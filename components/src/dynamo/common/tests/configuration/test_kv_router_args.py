@@ -423,6 +423,50 @@ def test_frontend_reasoning_field_name_rejects_invalid_choice() -> None:
         parser.parse_args(["--reasoning-field-name", "invalid"])
 
 
+def test_vllm_predicted_video_tokens_requires_prediction_index() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    config = FrontendConfig.from_cli_args(
+        parser.parse_args(
+            [
+                "--dyn-chat-processor",
+                "vllm",
+                "--router-mode",
+                "kv",
+                "--router-kv-events",
+                "--router-predicted-ttl-secs",
+                "60",
+                "--vllm-predicted-video-tokens",
+                "512",
+            ]
+        )
+    )
+
+    config.validate()
+    assert config.vllm_predicted_video_tokens == 512
+
+
+def test_vllm_predicted_video_tokens_rejects_event_only_index() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    config = FrontendConfig.from_cli_args(
+        parser.parse_args(
+            [
+                "--dyn-chat-processor",
+                "vllm",
+                "--router-mode",
+                "kv",
+                "--router-kv-events",
+                "--vllm-predicted-video-tokens",
+                "512",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="router-predicted-ttl-secs"):
+        config.validate()
+
+
 def test_frontend_response_plane_defaults_to_tcp_and_accepts_quic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

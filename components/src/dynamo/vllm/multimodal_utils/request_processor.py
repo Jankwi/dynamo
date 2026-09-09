@@ -818,6 +818,9 @@ class VllmMultimodalRequestProcessor:
             prompt_kwargs["multi_modal_uuids"] = mm_uuids
         if mm_processor_kwargs is not None:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        media_io_kwargs = request.get("media_io_kwargs")
+        if media_io_kwargs is not None:
+            prompt_kwargs["media_io_kwargs"] = media_io_kwargs
         return TokensPrompt(**prompt_kwargs)
 
     async def prepare_input(

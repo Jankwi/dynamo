@@ -7,6 +7,7 @@ Tests for the tool-stripping behaviour of _prepare_request when
 tool_choice='none' and the exclude_tools_when_tool_choice_none flag.
 """
 
+import hashlib
 import importlib.util
 import json
 from types import SimpleNamespace
@@ -916,6 +917,268 @@ async def test_prepare_mm_routing_opaque_uuid_skips_routing_and_transfer(
     assert cleanup_items == []
     assert transferred is False
     assert "extra_args" not in dynamo_preproc
+
+
+def test_video_mm_hash_matches_vllm_uuid_and_kwargs_semantics(
+    vllm_processor_module,
+    monkeypatch,
+):
+    captured = {}
+    monkeypatch.setattr(vllm_processor_module, "ProcessorInputs", SimpleNamespace())
+
+    def hash_kwargs(hash_algorithm, **kwargs):
+        captured["hash_algorithm"] = hash_algorithm
+        captured["kwargs"] = kwargs
+        return "a" * 64
+
+    monkeypatch.setattr(
+        vllm_processor_module,
+        "MultiModalHasher",
+        SimpleNamespace(hash_kwargs=hash_kwargs),
+    )
+
+    result = vllm_processor_module._video_mm_hash(
+        "video-key",
+        model_id="model-a",
+        hash_algorithm="sha256",
+        mm_processor_kwargs={
+            "common": 1,
+            "images_kwargs": {"size": 10},
+            "videos_kwargs": {"fps": 2},
+        },
+        media_io_kwargs={
+            "image": {"mode": "RGB"},
+            "video": {"num_frames": 8},
+        },
+    )
+
+    assert result == "a" * 64
+    assert captured == {
+        "hash_algorithm": "sha256",
+        "kwargs": {
+            "model_id": "model-a",
+            "video": "video-key",
+            "media_io_kwargs": {"video": {"num_frames": 8}},
+            "mm_processor_kwargs": {
+                "common": 1,
+                "videos_kwargs": {"fps": 2},
+            },
+        },
+    }
+
+
+def test_video_mm_hash_keeps_uuid_when_there_are_no_hash_factors(
+    vllm_processor_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(vllm_processor_module, "ProcessorInputs", SimpleNamespace())
+    assert (
+        vllm_processor_module._video_mm_hash(
+            "opaque-video-key",
+            model_id="model-a",
+            hash_algorithm="sha256",
+            mm_processor_kwargs=None,
+            media_io_kwargs=None,
+        )
+        == "opaque-video-key"
+    )
+
+
+def test_video_mm_hash_changes_with_video_processing_inputs(
+    vllm_processor_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(vllm_processor_module, "ProcessorInputs", SimpleNamespace())
+
+    def video_hash(*, num_frames, fps):
+        return vllm_processor_module._video_mm_hash(
+            "opaque-video-key",
+            model_id="model-a",
+            hash_algorithm="sha256",
+            mm_processor_kwargs={"videos_kwargs": {"fps": fps}},
+            media_io_kwargs={"video": {"num_frames": num_frames}},
+        )
+
+    baseline = video_hash(num_frames=8, fps=2)
+    assert video_hash(num_frames=16, fps=2) != baseline
+    assert video_hash(num_frames=8, fps=4) != baseline
+
+
+def test_video_mm_hash_uses_vllm_item_helper_when_available(
+    vllm_processor_module,
+    monkeypatch,
+):
+    captured = {}
+
+    def get_mm_item_hash(**kwargs):
+        captured.update(kwargs)
+        return "effective-video-hash"
+
+    monkeypatch.setattr(
+        vllm_processor_module,
+        "ProcessorInputs",
+        SimpleNamespace(get_mm_item_hash=get_mm_item_hash),
+    )
+
+    result = vllm_processor_module._video_mm_hash(
+        "video-key",
+        model_id="model-a",
+        hash_algorithm="sha256",
+        mm_processor_kwargs={"videos_kwargs": {"fps": 2}},
+        media_io_kwargs={"video": {"num_frames": 8}},
+    )
+
+    assert result == "effective-video-hash"
+    assert captured == {
+        "modality": "video",
+        "item": None,
+        "uuid_item": "video-key",
+        "model_id": "model-a",
+        "hash_algorithm": "sha256",
+        "hf_processor_mm_kwargs": {"videos_kwargs": {"fps": 2}},
+        "media_io_kwargs": {"video": {"num_frames": 8}},
+    }
+
+
+def test_build_predicted_video_routing_info_replaces_one_placeholder(
+    vllm_processor_module,
+):
+    mm_identifier = "0123456789abcdef" + "0" * 48
+    result = vllm_processor_module._build_predicted_video_routing_info(
+        [10, 20, 99, 30],
+        video_token_id=99,
+        mm_identifier=mm_identifier,
+        predicted_video_tokens=4,
+    )
+
+    pad = vllm_processor_module.pad_value_for_mm_hash(0x0123456789ABCDEF)
+    assert result == {
+        "routing_token_ids": [10, 20, pad, pad, pad, pad, 30],
+        "block_mm_infos": [],
+        "expanded_prompt_len": 7,
+    }
+
+
+def test_prepare_predicted_video_request_derives_uuid_without_mutating_url(
+    vllm_processor_module,
+):
+    url = "https://media.example/video.mp4"
+    request = {
+        "model": "model-a",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                    {"type": "text", "text": "What happens?"},
+                ],
+            }
+        ],
+    }
+    mm_data = {"video_url": [{"Url": url}]}
+
+    shadow, mm_uuids = vllm_processor_module._prepare_predicted_video_request(
+        request, mm_data, None
+    )
+
+    source_uuid = hashlib.sha256(url.encode()).hexdigest()
+    shadow_video = shadow["messages"][0]["content"][0]
+    assert shadow_video["video_url"]["url"] == ""
+    assert shadow_video["uuid"] == source_uuid
+    assert mm_uuids == {"video_url": [source_uuid]}
+    assert request["messages"][0]["content"][0]["video_url"]["url"] == url
+    assert "uuid" not in request["messages"][0]["content"][0]
+
+
+@pytest.mark.asyncio
+async def test_prepare_mm_routing_builds_prediction_without_event_markers(
+    vllm_processor_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        vllm_processor_module,
+        "_video_mm_hash",
+        lambda *args, **kwargs: "0123456789abcdef" + "0" * 48,
+    )
+    processor = vllm_processor_module.VllmProcessor.__new__(
+        vllm_processor_module.VllmProcessor
+    )
+    processor.predicted_video_tokens = 3
+    processor.predicted_video_token_id = 99
+    processor.input_processor = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="model-a",
+            get_multimodal_config=lambda: SimpleNamespace(mm_hasher_algorithm="sha256"),
+        )
+    )
+
+    dynamo_preproc = {"multi_modal_uuids": {"video_url": ["opaque-video-key"]}}
+    mm_routing_info, cleanup_items, transferred = await processor._prepare_mm_routing(
+        SimpleNamespace(prompt_token_ids=[1, 99, 2], mm_features=None),
+        dynamo_preproc,
+        mm_processor_kwargs={"videos_kwargs": {"fps": 2}},
+        media_io_kwargs={"video": {"num_frames": 8}},
+    )
+
+    assert cleanup_items == []
+    assert transferred is False
+    assert mm_routing_info is not None
+    assert mm_routing_info["expanded_prompt_len"] == 5
+    assert "extra_args" not in dynamo_preproc
+
+
+@pytest.mark.asyncio
+async def test_generator_sends_fetch_free_video_shadow_to_preprocessor(
+    vllm_processor_module,
+    monkeypatch,
+):
+    url = "https://media.example/video.mp4"
+
+    async def inspect_shadow(request, **kwargs):
+        video = request["messages"][0]["content"][0]
+        assert video["video_url"]["url"] == ""
+        assert video["uuid"] == hashlib.sha256(url.encode()).hexdigest()
+        raise RuntimeError("shadow inspected")
+
+    monkeypatch.setattr(
+        vllm_processor_module,
+        "preprocess_chat_request",
+        inspect_shadow,
+    )
+    processor = vllm_processor_module.VllmProcessor.__new__(
+        vllm_processor_module.VllmProcessor
+    )
+    processor.predicted_video_tokens = 128
+    processor.tokenizer = object()
+    processor.input_processor = SimpleNamespace(
+        renderer=object(), model_config=object()
+    )
+    processor.tool_parser_class = None
+    processor.reasoning_parser_class = None
+    processor.exclude_tools_when_tool_choice_none = True
+    processor.enable_auto_tool_choice = False
+    processor.default_chat_template_kwargs = None
+    processor.default_thinking_mode = None
+    processor.structural_tag_mode = "off"
+    processor.structural_tag_scope = "auto"
+    processor.structural_tag_schema = "auto"
+
+    request = {
+        "model": "model-a",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                    {"type": "text", "text": "What happens?"},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(RuntimeError, match="shadow inspected"):
+        await anext(processor._generator_inner(request))
+
+    assert request["messages"][0]["content"][0]["video_url"]["url"] == url
 
 
 class TestReasoningParserMetadata:

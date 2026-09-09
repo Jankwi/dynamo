@@ -6,12 +6,14 @@
 #
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +21,8 @@ from msgspec.structs import replace as msgspec_replace
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.exceptions import VLLMClientError
+from vllm.multimodal.hasher import MultiModalHasher
+from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import GENERATION_TASKS
@@ -35,7 +39,10 @@ from dynamo.common.multimodal.mm_kwargs_transfer import (
     MmKwargsSender,
     MmKwargsShmSender,
 )
-from dynamo.common.multimodal.routing_utils import build_mm_routing_info_from_features
+from dynamo.common.multimodal.routing_utils import (
+    build_mm_routing_info_from_features,
+    pad_value_for_mm_hash,
+)
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
@@ -56,6 +63,10 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+_HF_MODALITY_PROCESSOR_KWARGS = frozenset(
+    {"images_kwargs", "videos_kwargs", "audio_kwargs"}
+)
+
 
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "eos": FinishReason.STOP,
@@ -65,6 +76,162 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "cancelled": FinishReason.ABORT,
     "content_filter": FinishReason.STOP,
 }
+
+
+def _video_mm_hash(
+    source_uuid: str,
+    *,
+    model_id: str,
+    hash_algorithm: Any,
+    mm_processor_kwargs: dict[str, Any] | None,
+    media_io_kwargs: dict[str, dict[str, Any]] | None,
+) -> str:
+    """Compute vLLM's UUID-backed video processor-cache identity.
+
+    Use vLLM's item-level helper when available. The local fallback mirrors the
+    newer ``ProcessorInputs.get_mm_hashes`` factor scoping without constructing
+    decoded ``MultiModalDataItems``, keeping the Dynamo-pinned release usable.
+    """
+    get_mm_item_hash = getattr(ProcessorInputs, "get_mm_item_hash", None)
+    if get_mm_item_hash is not None:
+        return get_mm_item_hash(
+            modality="video",
+            item=None,
+            uuid_item=source_uuid,
+            model_id=model_id,
+            hash_algorithm=hash_algorithm,
+            hf_processor_mm_kwargs=mm_processor_kwargs or {},
+            media_io_kwargs=media_io_kwargs or {},
+        )
+
+    processor_kwargs = {
+        key: value
+        for key, value in (mm_processor_kwargs or {}).items()
+        if key not in _HF_MODALITY_PROCESSOR_KWARGS or key == "videos_kwargs"
+    }
+    video_io_kwargs = (media_io_kwargs or {}).get("video", {})
+    scoped_media_io_kwargs = {"video": video_io_kwargs} if video_io_kwargs else {}
+    hash_factors = {
+        key: value
+        for key, value in {
+            "media_io_kwargs": scoped_media_io_kwargs,
+            "mm_processor_kwargs": processor_kwargs,
+        }.items()
+        if value
+    }
+    if not hash_factors:
+        return source_uuid
+
+    return MultiModalHasher.hash_kwargs(
+        hash_algorithm,
+        model_id=model_id,
+        video=source_uuid,
+        **hash_factors,
+    )
+
+
+def _routing_hash_for_mm_identifier(identifier: str) -> int:
+    """Map a vLLM MM identity to a stable routing-side integer."""
+    if len(identifier) == 64 and all(
+        char in "0123456789abcdefABCDEF" for char in identifier
+    ):
+        return int(identifier[:16], 16)
+    return int.from_bytes(hashlib.sha256(identifier.encode()).digest()[:8], "big")
+
+
+def _build_predicted_video_routing_info(
+    prompt_token_ids: list[int],
+    *,
+    video_token_id: int,
+    mm_identifier: str,
+    predicted_video_tokens: int,
+) -> dict[str, Any]:
+    """Replace one video placeholder with a fixed routing-only pad run."""
+    positions = [
+        index
+        for index, token_id in enumerate(prompt_token_ids)
+        if token_id == video_token_id
+    ]
+    if len(positions) != 1:
+        raise ValueError(
+            "predicted video routing requires exactly one video placeholder token; "
+            f"found {len(positions)}"
+        )
+
+    position = positions[0]
+    pad = pad_value_for_mm_hash(_routing_hash_for_mm_identifier(mm_identifier))
+    routing_token_ids = (
+        prompt_token_ids[:position]
+        + [pad] * predicted_video_tokens
+        + prompt_token_ids[position + 1 :]
+    )
+    return {
+        "routing_token_ids": routing_token_ids,
+        "block_mm_infos": [],
+        "expanded_prompt_len": len(routing_token_ids),
+    }
+
+
+def _prepare_predicted_video_request(
+    request: dict[str, Any],
+    mm_data: dict[str, list[dict[str, str]]] | None,
+    mm_uuids: dict[str, list[str | None]] | None,
+) -> tuple[dict[str, Any], dict[str, list[str | None]] | None]:
+    """Build a fetch-free render request and fill a video cache identity."""
+    videos = (mm_data or {}).get("video_url", [])
+    if not videos:
+        return request, mm_uuids
+    other_media_count = sum(
+        len(items)
+        for modality, items in (mm_data or {}).items()
+        if modality != "video_url"
+    )
+    if other_media_count:
+        raise ValueError(
+            "predicted video routing currently supports video-only multimodal requests"
+        )
+    if len(videos) != 1:
+        raise ValueError(
+            "predicted video routing currently supports exactly one video per request"
+        )
+
+    video_uuids = list((mm_uuids or {}).get("video_url", [None]))
+    if len(video_uuids) != 1:
+        raise ValueError("video UUID count does not match the single video input")
+    source_uuid = video_uuids[0]
+    if source_uuid is None:
+        url = videos[0].get("Url")
+        if not url:
+            raise ValueError("predicted video routing requires a video URL or UUID")
+        source_uuid = hashlib.sha256(url.encode()).hexdigest()
+        video_uuids[0] = source_uuid
+
+    routed_uuids = dict(mm_uuids or {})
+    routed_uuids["video_url"] = video_uuids
+
+    shadow = deepcopy(request)
+    shadow_video_count = 0
+    for message in shadow.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "video_url":
+                continue
+            video_url = part.get("video_url")
+            if not isinstance(video_url, dict):
+                raise ValueError("video_url must be an object")
+            part["video_url"] = {**video_url, "url": ""}
+            part["uuid"] = source_uuid
+            shadow_video_count += 1
+
+    if shadow_video_count != 1:
+        raise ValueError(
+            "predicted video routing could not locate exactly one video content part"
+        )
+    return shadow, routed_uuids
 
 
 class _ReasoningUsageAnnotator:
@@ -366,6 +533,7 @@ class VllmProcessor:
         structural_tag_mode: str = "off",
         structural_tag_scope: str = "auto",
         structural_tag_schema: str = "auto",
+        predicted_video_tokens: int = 0,
     ):
         self.tokenizer = tokenizer
         self.input_processor = input_processor
@@ -381,6 +549,17 @@ class VllmProcessor:
         self.structural_tag_mode = structural_tag_mode
         self.structural_tag_scope = structural_tag_scope
         self.structural_tag_schema = structural_tag_schema
+        self.predicted_video_tokens = predicted_video_tokens
+        self.predicted_video_token_id: int | None = None
+        if predicted_video_tokens:
+            hf_config = self.input_processor.model_config.hf_config
+            video_token_id = getattr(hf_config, "video_token_id", None)
+            if not isinstance(video_token_id, int) or isinstance(video_token_id, bool):
+                raise ValueError(
+                    "--vllm-predicted-video-tokens requires a model with "
+                    "hf_config.video_token_id"
+                )
+            self.predicted_video_token_id = video_token_id
         # Sender for mm_kwargs transfer — instantiated lazily on first MM request.
         # MmKwargsShmSender for same-node transfers (default), MmKwargsNixlSender
         # for cross-node RDMA. Controlled by DYNAMO_MM_TRANSFER env var.
@@ -416,6 +595,7 @@ class VllmProcessor:
         vllm_preproc: EngineCoreRequest,
         dynamo_preproc: dict[str, Any],
         mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[dict | None, list, bool]:
         """Extract MM routing info and prepare mm_kwargs transfer.
 
@@ -430,6 +610,36 @@ class VllmProcessor:
 
         rng_routing = _nvtx.start_range("mm_frontend:build_routing_info", color="cyan")
         if dynamo_preproc.get("multi_modal_uuids"):
+            video_uuids = dynamo_preproc["multi_modal_uuids"].get("video_url", [])
+            if getattr(self, "predicted_video_tokens", 0) and video_uuids:
+                if len(video_uuids) != 1 or not video_uuids[0]:
+                    raise ValueError(
+                        "predicted video routing requires exactly one non-empty video UUID"
+                    )
+                assert self.predicted_video_token_id is not None
+                mm_config = self.input_processor.model_config.get_multimodal_config()
+                mm_identifier = _video_mm_hash(
+                    video_uuids[0],
+                    model_id=self.input_processor.model_config.model,
+                    hash_algorithm=mm_config.mm_hasher_algorithm,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    media_io_kwargs=media_io_kwargs,
+                )
+                mm_routing_info = _build_predicted_video_routing_info(
+                    list(vllm_preproc.prompt_token_ids),
+                    video_token_id=self.predicted_video_token_id,
+                    mm_identifier=mm_identifier,
+                    predicted_video_tokens=self.predicted_video_tokens,
+                )
+                logger.debug(
+                    "[mm-routing] Built predicted video routing: hash=%s..., "
+                    "tokens=%d",
+                    mm_identifier[:16],
+                    self.predicted_video_tokens,
+                )
+                _nvtx.end_range(rng_routing)
+                return mm_routing_info, cleanup_items, nixl_transferred
+
             # Keep the worker as the source of truth for UUID-backed media. A
             # worker-side processor-cache entry must include model-specific
             # prompt updates as well as tensors; frontend tensor transfer cannot
@@ -604,13 +814,21 @@ class VllmProcessor:
         # Preserve user cache UUIDs alongside URL-backed media. UUID-only image
         # slots are resolved by the worker-side vLLM processor cache.
         mm_data, mm_uuids = extract_mm_urls(messages)
+        request_for_preprocessing = request
+        if self.predicted_video_tokens:
+            try:
+                request_for_preprocessing, mm_uuids = _prepare_predicted_video_request(
+                    request, mm_data, mm_uuids
+                )
+            except ValueError as exc:
+                raise HttpError(400, f"Validation: {exc}") from exc
 
         # Images are fetched by vLLM's renderer via DynamoMediaConnector,
         # which wraps our ImageLoader (LRU cache + in-flight dedup).
         # No data URI encoding needed.
         with _nvtx.annotate("mm_frontend:preprocess_chat", color="yellow"):
             pre = await preprocess_chat_request(
-                request,
+                request_for_preprocessing,
                 tokenizer=self.tokenizer,
                 renderer=self.input_processor.renderer,
                 tool_parser_class=self.tool_parser_class,
@@ -766,6 +984,7 @@ class VllmProcessor:
                 vllm_preproc,
                 dynamo_preproc,
                 mm_processor_kwargs=request_for_sampling.mm_processor_kwargs,
+                media_io_kwargs=getattr(request_for_sampling, "media_io_kwargs", None),
             )
 
             # Forward multimodal URLs so the backend handler can load the media.
@@ -788,6 +1007,9 @@ class VllmProcessor:
                 dynamo_preproc[
                     "mm_processor_kwargs"
                 ] = request_for_sampling.mm_processor_kwargs
+            media_io_kwargs = getattr(request_for_sampling, "media_io_kwargs", None)
+            if media_io_kwargs is not None:
+                dynamo_preproc["media_io_kwargs"] = media_io_kwargs
 
             def new_post_processor() -> StreamingPostProcessor:
                 # vLLM tool parsers keep mutable streaming state. Give every
@@ -1252,6 +1474,7 @@ class EngineFactory:
             structural_tag_mode=structural_tag_mode,
             structural_tag_scope=structural_tag_scope,
             structural_tag_schema=structural_tag_schema,
+            predicted_video_tokens=self.config.vllm_predicted_video_tokens,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none

@@ -90,6 +90,7 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     response_plane: str = "tcp"
     event_plane: Optional[str] = None
     chat_processor: str
+    vllm_predicted_video_tokens: int
     enable_anthropic_api: bool
     strip_anthropic_preamble: bool
     debug_perf: bool
@@ -147,6 +148,23 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
                 f"--tokenizer: invalid value '{self.tokenizer_backend}' "
                 f"(choose from {sorted(self._VALID_TOKENIZER_BACKENDS)})"
             )
+        if self.vllm_predicted_video_tokens < 0:
+            raise ValueError("--vllm-predicted-video-tokens must be >= 0")
+        if self.vllm_predicted_video_tokens:
+            if self.chat_processor != "vllm":
+                raise ValueError(
+                    "--vllm-predicted-video-tokens requires "
+                    "--dyn-chat-processor=vllm"
+                )
+            if self.router_mode != "kv":
+                raise ValueError(
+                    "--vllm-predicted-video-tokens requires --router-mode=kv"
+                )
+            if self.use_kv_events and self.router_predicted_ttl_secs is None:
+                raise ValueError(
+                    "--vllm-predicted-video-tokens with KV events requires "
+                    "--router-predicted-ttl-secs"
+                )
         if self.router_prefill_load_model == "aic":
             if self.router_mode != "kv":
                 raise ValueError(
@@ -626,6 +644,19 @@ class FrontendArgGroup(ArgGroup):
                 "parsing, and reasoning parsing."
             ),
             choices=["dynamo", "vllm", "sglang"],
+        )
+
+        add_argument(
+            g,
+            flag_name="--vllm-predicted-video-tokens",
+            env_var="DYN_VLLM_PREDICTED_VIDEO_TOKENS",
+            default=0,
+            help=(
+                "[EXPERIMENTAL] With the vLLM chat processor, represent one "
+                "UUID-backed video as this many identical routing-only tokens. "
+                "The frontend does not decode the video. Use 0 to disable."
+            ),
+            arg_type=int,
         )
 
         add_negatable_bool_argument(

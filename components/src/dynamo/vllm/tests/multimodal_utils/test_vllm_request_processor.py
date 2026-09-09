@@ -604,11 +604,13 @@ def test_build_tokens_prompt_forwards_hashes_kwargs_and_vision_chunk():
     processor = _processor(unified_vision_chunk=True)
     mm_data = {"vision_chunk": {"type": "image", "image": object(), "uuid": None}}
     routing_hash = "0123456789abcdef"
+    media_io_kwargs = {"video": {"num_frames": 8}}
 
     prompt = processor.build_tokens_prompt(
         {
             "token_ids": [1, 2, 3],
             "extra_args": {"mm_hashes": [routing_hash]},
+            "media_io_kwargs": media_io_kwargs,
         },
         mm_data,
         {"num_crops": 4},
@@ -618,6 +620,7 @@ def test_build_tokens_prompt_forwards_hashes_kwargs_and_vision_chunk():
     assert prompt["multi_modal_data"] is mm_data
     assert prompt["multi_modal_uuids"] == {"vision_chunk": [routing_hash + "0" * 48]}
     assert prompt["mm_processor_kwargs"] == {"num_crops": 4}
+    assert prompt["media_io_kwargs"] is media_io_kwargs
 
 
 def test_build_tokens_prompt_prefers_opaque_user_uuids_without_padding():
